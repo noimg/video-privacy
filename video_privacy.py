@@ -23,6 +23,7 @@ MODEL_URL = ('https://media.githubusercontent.com/media/opencv/opencv_zoo/main/'
              'models/face_detection_yunet/face_detection_yunet_2023mar.onnx')
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.webm', '.mts', '.m2ts', '.ts'}
 VERSION = 1
+RENDER_VERSION = 2
 
 
 def log(message):
@@ -240,6 +241,8 @@ def timeline(detections, info, args):
     guard = max(args.hold, 1 / args.detect_fps if args.detect_fps else 1 / max(info['fps'], 1))
     length = min(info['duration'] - args.start, args.duration or math.inf)
     for i, entry in enumerate(detections):
+        if entry['time'] - guard >= length or entry['time'] + guard <= 0:
+            continue
         boxes = [expand_box(b, info['width'], info['height'], args.margin) for b in entry['boxes']]
         events.extend([(round(max(0, entry['time'] - guard), 6), 1, i, boxes),
                        (round(min(length, entry['time'] + guard), 6), -1, i, [])])
@@ -345,6 +348,39 @@ def choose_encoder(requested):
 
 
 def render(path, output, info, args, changes, encoder):
+    if not changes or args.render_mode == 'full':
+        return render_full(path, output, info, args, changes, encoder)
+    from sparse_render import SparseUnsupported, render_sparse
+    if encoder != 'libx264':
+        if args.render_mode == 'sparse':
+            raise ValueError('--render-mode sparse 目前需要 --encoder cpu')
+        return render_full(path, output, info, args, changes, encoder)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix='.privacy-', dir=output.parent) as tmp:
+            temporary = Path(tmp) / 'sparse.mp4'
+            result = render_sparse(path, temporary, info, args, changes, STOP, log)
+            checked = probe(temporary)
+            if args.mode != 'blur' and checked['audio']:
+                raise RuntimeError('输出验证失败：仍有音频轨')
+            if args.mode == 'blur' and info['audio'] and not checked['audio']:
+                raise RuntimeError('输出验证失败：音频轨丢失')
+            if (checked['width'], checked['height']) != (info['width'], info['height']):
+                raise RuntimeError('输出验证失败：分辨率改变')
+            expected = min(info['duration'], args.duration or math.inf)
+            if abs(checked['duration'] - expected) > 1:
+                raise RuntimeError('分段输出时长验证失败')
+            result['output'] = checked
+            os.replace(temporary, output)
+            return result
+    except SparseUnsupported as exc:
+        if args.render_mode == 'sparse':
+            raise
+        log(f'[{path.name}] 使用完整编码：{exc}')
+        return render_full(path, output, info, args, changes, encoder)
+
+
+def render_full(path, output, info, args, changes, encoder):
     began = time.monotonic()
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.privacy-', dir=output.parent) as tmp:
@@ -428,6 +464,7 @@ def render(path, output, info, args, changes, encoder):
             raise RuntimeError(f'输出时长异常：{checked["duration"]:.3f}s，预期 {expected:.3f}s')
         os.replace(temporary, output)
     return {'seconds': time.monotonic() - began, 'output': checked,
+            'strategy': 'full' if changes else 'stream-copy',
             'encoder': encoder if changes else 'stream-copy'}
 
 
@@ -436,7 +473,7 @@ def process_video(path, output, args, encoder):
     info = probe(path)
     if args.start >= info['duration']:
         raise ValueError('起始时间超出视频长度')
-    identity = {'version': VERSION, 'source': source_id(path),
+    identity = {'version': RENDER_VERSION, 'source': source_id(path),
                 'options': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
                             if k not in ('input', 'output', 'jobs', 'overwrite', 'rescan', 'scan_only')},
                 'model_sha256': ensure_model(args.model) if args.mode != 'mute' else None}
@@ -489,6 +526,8 @@ def parse_args(argv=None):
     parser.add_argument('--block-size', type=int, default=32, help='原图马赛克块尺寸（像素）')
     parser.add_argument('--encoder', choices=['auto', 'cpu', 'nvenc'], default='auto',
                         help='auto 实测 NVENC，不可用时回退 CPU')
+    parser.add_argument('--render-mode', choices=['auto', 'full', 'sparse'], default='auto',
+                        help='auto=兼容时仅重编码含人脸的关键帧组；full=完整编码；sparse=强制分段编码')
     parser.add_argument('--preset', default='superfast',
                         choices=['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
                         help='CPU 编码预设')

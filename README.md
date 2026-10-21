@@ -42,9 +42,23 @@ python video_privacy.py ./Videos-origin -o ./Videos-preview --duration 120
 python video_privacy.py ./Videos-origin -o ./Videos-careful --detect-fps 0 --detect-size 1280 --threshold 0.5
 ```
 
-工具自动试用 NVIDIA NVENC，不可用时回退 CPU。仅静音或整段未检出人脸时直接复制视频流；有打码内容时会重编码整段视频。50 多个长视频建议从 `--jobs 2` 开始调整并发。
+CPU 默认采用分段编码：**只重编码需要打码的关键帧组，其余直接复制视频流**，适合人脸出现频率低的长视频。检测频率不变，关键帧组内也只遮挡原本需要打码的时刻。直接复制的画面保留原始画质。
 
-测试视频前 120 秒实测：CPU 扫描约 15 秒，马赛克编码约 37 秒（每线程池 8 线程、superfast）。未测试完整 95 分钟视频，实际速度取决于硬件和内容。
+```bash
+# 已有旧版检测缓存时，可直接复用并重新输出
+python video_privacy.py ./Videos-origin -o ./Videos-processed --encoder cpu --overwrite
+
+# 强制使用原来的完整编码方式
+python video_privacy.py ./Videos-origin -o ./Videos-full --render-mode full
+```
+
+分段编码支持无 B 帧、无旋转的偶数尺寸 H.264 / YUV420P 视频。其他格式、非零 `--start`、无损编码（`--quality 0`）会自动回退完整编码；`--render-mode sparse` 可强制分段处理并在不兼容时报告错误。输出使用 MP4 / avc3 封装，若播放器兼容性有问题可改用 `--render-mode full`。
+
+工具自动试用 NVIDIA NVENC，不可用时回退 CPU；使用 NVENC 时仍采用完整编码。50 多个长视频建议从 `--jobs 2` 开始调整并发。新视频仍需先扫描全片，分段编码主要减少输出阶段的耗时。
+
+同一 CPU 环境下，测试视频前 120 秒的输出阶段从完整编码的约 103 秒降至分段编码的约 24.5 秒（4 线程、superfast、复用检测缓存）；实际速度取决于人脸分布、关键帧间隔和硬件负载。
+
+完整约 95 分钟的测试视频复用旧版检测缓存后，输出耗时约 **10 分 18 秒**，旧版记录为约 **122 分钟**；82.3% 的帧直接复制。两次完整处理时系统负载可能不同，此对比仅包含输出阶段。
 
 ## 缓存与参数
 
