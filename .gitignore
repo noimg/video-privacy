@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.cache/
+.privacy-*/
+/examples/
+.venv/
+*.report.json
+failures.json
