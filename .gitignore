@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 *.report.json
 failures.json
+/models/object_detection_yolox_2022nov.onnx

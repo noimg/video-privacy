@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""批量静音与人脸打码。运行 python video_privacy.py --help。"""
+"""批量静音、人脸与手机/电脑屏幕打码。运行 python video_privacy.py --help。"""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +15,8 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
+
+import screen_detector
 
 ROOT = Path(__file__).resolve().parent
 MODEL = ROOT / 'models/face_detection_yunet_2023mar.onnx'
@@ -110,10 +112,20 @@ def scan(path, info, args, cache_path):
     import cv2
     import numpy as np
 
-    model_sha = ensure_model(args.model)
+    # Reuse libswscale's context and bound its pool. Frame.reformat() creates a
+    # fresh context for each sampled frame and otherwise defaults to all CPUs.
+    reformatter = av.video.reformatter.VideoReformatter()
+    faces_enabled = 'face' in args.targets
+    screens_enabled = 'screen' in args.targets
+    model_sha = ensure_model(args.model) if faces_enabled else None
     settings = {'version': VERSION, 'source': source_id(path), 'model': model_sha,
                 'fps': args.detect_fps, 'size': args.detect_size, 'threshold': args.threshold,
                 'start': args.start, 'duration': args.duration, 'rotation': info['rotation']}
+    # Keep face-only signatures compatible with previously saved long scans.
+    if screens_enabled:
+        settings['screens'] = {'version': screen_detector.VERSION, 'targets': args.targets,
+                               'model': screen_detector.ensure_model(args.screen_model),
+                               'threshold': args.screen_threshold, 'device': args.screen_device}
     signature = digest(settings)
     cached = {}
     if cache_path.exists() and not args.rescan:
@@ -121,18 +133,28 @@ def scan(path, info, args, cache_path):
         if cached.get('signature') != signature:
             cached = {}
     if cached.get('complete'):
-        log(f'[{path.name}] 使用检测缓存，{len(cached["detections"])} 个含人脸采样帧')
+        log(f'[{path.name}] 使用检测缓存，{len(cached["detections"])} 组检测结果')
         return cached
 
-    scale = min(1, args.detect_size / max(info['width'], info['height']))
+    size = max(args.detect_size if faces_enabled else 0, 640 if screens_enabled else 0)
+    scale = min(1, size / max(info['width'], info['height']))
     w, h = max(32, round(info['width'] * scale)), max(32, round(info['height'] * scale))
-    detector = cv2.FaceDetectorYN.create(str(args.model), '', (w, h), args.threshold, .3, 5000)
+    face_scale = min(1, args.detect_size / max(info['width'], info['height']))
+    fw, fh = max(32, round(info['width'] * face_scale)), max(32, round(info['height'] * face_scale))
+    detector = (cv2.FaceDetectorYN.create(str(args.model), '', (fw, fh), args.threshold, .3, 5000)
+                if faces_enabled else None)
+    screens = (screen_detector.ScreenDetector(args.screen_model, args.screen_threshold,
+                                              args.screen_device, args.threads)
+               if screens_enabled else None)
     total = min(info['duration'] - args.start, args.duration or math.inf)
     if total <= 0:
         raise ValueError('起始时间超出视频长度')
     data = cached or {'signature': signature, 'settings': settings, 'detections': [],
                       'scanned_until': -1.0, 'next_sample': 0.0, 'samples': 0,
                       'complete': False, 'scan_seconds': 0.0}
+    if screens:
+        data['screen_backend'] = screens.backend
+        log(f'[{path.name}] 屏幕检测：YOLOX-S / {screens.backend.upper()}，手机、笔记本、显示器')
     interval = 1 / args.detect_fps if args.detect_fps else 0
     began = time.monotonic()
     last_save = last_log = began
@@ -170,17 +192,25 @@ def scan(path, info, args, cache_path):
                     data['scanned_until'] = t
                     continue
                 rw, rh = (h, w) if info['rotation'] in (90, 270) else (w, h)
-                image = frame.reformat(width=rw, height=rh, format='bgr24').to_ndarray()
+                image = reformatter.reformat(frame, width=rw, height=rh, format='bgr24',
+                                             threads=args.threads).to_ndarray()
                 if info['rotation']:
                     image = np.ascontiguousarray(np.rot90(image, info['rotation'] // 90))
-                _, faces = detector.detect(image)
+                faces = None
+                if detector:
+                    face_image = cv2.resize(image, (fw, fh)) if (fw, fh) != (w, h) else image
+                    _, faces = detector.detect(face_image)
+                screen_boxes = screens.detect(image) if screens else []
                 data['samples'] += 1
                 if faces is not None:
                     boxes = []
                     for f in faces:
                         x, y, bw, bh = map(float, f[:4])
-                        boxes.append([x / w, y / h, bw / w, bh / h, float(f[14])])
+                        boxes.append([x / fw, y / fh, bw / fw, bh / fh, float(f[14])])
                     data['detections'].append({'time': round(t, 6), 'boxes': boxes})
+                if screen_boxes:
+                    data['detections'].append({'time': round(t, 6), 'boxes': screen_boxes,
+                                               'target': 'screen'})
                 if interval:
                     data['next_sample'] = (math.floor((t + 1e-6) / interval) + 1) * interval
                 data['scanned_until'] = t
@@ -191,9 +221,9 @@ def scan(path, info, args, cache_path):
                 if now - last_log >= 15:
                     speed = (t - max(0, resume)) / max(.001, now - began)
                     log(f'[{path.name}] 扫描 {t:.0f}/{total:.0f}s，{speed:.1f} 倍速，'
-                        f'人脸帧 {len(data["detections"])}')
+                        f'检测结果 {len(data["detections"])} 组')
                     last_log = now
-        # A truncated decoder must never turn the unscanned tail into "no faces".
+        # A truncated decoder must never turn an unscanned tail into "no targets".
         if data['scanned_until'] < total - max(1.0, 3 / max(info['fps'], 1)):
             raise RuntimeError(f'视频提前结束：仅扫描到 {data["scanned_until"]:.2f}/{total:.2f}s')
         data['complete'] = True
@@ -243,7 +273,8 @@ def timeline(detections, info, args):
     for i, entry in enumerate(detections):
         if entry['time'] - guard >= length or entry['time'] + guard <= 0:
             continue
-        boxes = [expand_box(b, info['width'], info['height'], args.margin) for b in entry['boxes']]
+        margin = args.screen_margin if entry.get('target') == 'screen' else args.margin
+        boxes = [expand_box(b, info['width'], info['height'], margin) for b in entry['boxes']]
         events.extend([(round(max(0, entry['time'] - guard), 6), 1, i, boxes),
                        (round(min(length, entry['time'] + guard), 6), -1, i, [])])
     events.sort(key=lambda e: e[0])
@@ -473,10 +504,16 @@ def process_video(path, output, args, encoder):
     info = probe(path)
     if args.start >= info['duration']:
         raise ValueError('起始时间超出视频长度')
+    ignored = {'input', 'output', 'jobs', 'overwrite', 'rescan', 'scan_only'}
+    if args.mode == 'mute' or args.targets == ['face']:
+        ignored.update({'targets', 'screen_model', 'screen_threshold', 'screen_device', 'screen_margin'})
     identity = {'version': RENDER_VERSION, 'source': source_id(path),
                 'options': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
-                            if k not in ('input', 'output', 'jobs', 'overwrite', 'rescan', 'scan_only')},
-                'model_sha256': ensure_model(args.model) if args.mode != 'mute' else None}
+                            if k not in ignored},
+                'model_sha256': (ensure_model(args.model)
+                                 if args.mode != 'mute' and 'face' in args.targets else None)}
+    if args.mode != 'mute' and 'screen' in args.targets:
+        identity['screen_model_sha256'] = screen_detector.ensure_model(args.screen_model)
     signature = digest(identity)
     report_path = output.with_suffix('.report.json')
     if output.exists() and not args.scan_only:
@@ -487,7 +524,10 @@ def process_video(path, output, args, encoder):
                 log(f'[{path.name}] 已完成，跳过（--overwrite 可重做）')
                 return report
             raise ValueError(f'输出已存在且参数或来源不同：{output}。使用 --overwrite 覆盖。')
-    cache_path = args.output / '.cache' / (digest(str(path))[:20] + '.json')
+    cache_name = digest(str(path))[:20]
+    if 'screen' in args.targets:
+        cache_name += '-' + '-'.join(args.targets)
+    cache_path = args.output / '.cache' / (cache_name + '.json')
     data = None if args.mode == 'mute' else scan(path, info, args, cache_path)
     if args.scan_only:
         log(f'[{path.name}] 检测已保存：{cache_path}')
@@ -496,8 +536,15 @@ def process_video(path, output, args, encoder):
     render_result = render(path, output, info, args, changes, encoder)
     report = {'signature': signature, 'input': str(path), 'output': str(output),
               'source': info, 'mode': args.mode, 'style': args.style,
-              'detect_fps': args.detect_fps,
-              'face_samples': len(data['detections']) if data else 0,
+              'targets': args.targets, 'detect_fps': args.detect_fps,
+              'face_samples': sum(e.get('target', 'face') == 'face'
+                                  for e in data['detections']) if data else 0,
+              'screen_samples': sum(e.get('target') == 'screen'
+                                    for e in data['detections']) if data else 0,
+              'screen_backend': data.get('screen_backend') if data else None,
+              'screen_objects': {name: sum(b[5] == name for e in data['detections']
+                                          if e.get('target') == 'screen' for b in e['boxes'])
+                                 if data else 0 for name in screen_detector.CLASSES.values()},
               'samples': data['samples'] if data else 0,
               'scan_seconds': data['scan_seconds'] if data else 0,
               'render': render_result, 'total_seconds': time.monotonic() - began,
@@ -508,7 +555,7 @@ def process_video(path, output, args, encoder):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description='批量去音频、人脸马赛克/黑块；默认同时处理。',
+    parser = argparse.ArgumentParser(description='批量去音频、人脸及手机/电脑屏幕打码；默认静音+人脸打码。',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('input', nargs='?', type=Path, default=ROOT.parent / 'Videos-origin',
                         help='输入文件或目录，目录递归处理')
@@ -517,17 +564,26 @@ def parse_args(argv=None):
     parser.add_argument('--mode', choices=['both', 'mute', 'blur'], default='both',
                         help='both=静音+打码，mute=仅静音，blur=仅打码并保留音频')
     parser.add_argument('--style', choices=['mosaic', 'black'], default='mosaic', help='打码样式')
+    parser.add_argument('--targets', nargs='+', choices=['face', 'screen'], default=['face'],
+                        help='打码对象：face=人脸，screen=手机/笔记本/显示器；可同时指定')
     parser.add_argument('--detect-fps', type=float, default=5,
-                        help='每秒检测帧数；0=按原始时间戳逐帧检测，抽帧可能漏掉短暂人脸')
-    parser.add_argument('--detect-size', type=int, default=640, help='检测图最长边；小脸多时可设 960/1280')
+                        help='人脸和屏幕每秒检测帧数；0=逐帧检测，抽帧可能漏掉短暂目标')
+    parser.add_argument('--detect-size', type=int, default=640,
+                        help='人脸检测图最长边；小脸多时可设 960/1280；屏幕模型固定输入 640×640')
     parser.add_argument('--threshold', type=float, default=.65, help='人脸置信度阈值')
-    parser.add_argument('--margin', type=float, default=.2, help='检测框每侧外扩比例')
+    parser.add_argument('--screen-model', type=Path, default=screen_detector.MODEL,
+                        help='YOLOX-S 640 COCO ONNX 模型路径，默认模型缺失时自动下载')
+    parser.add_argument('--screen-threshold', type=float, default=.3, help='屏幕设备置信度阈值')
+    parser.add_argument('--screen-device', choices=['auto', 'cpu', 'cuda'], default='auto',
+                        help='屏幕推理设备；auto 优先使用 ONNX Runtime CUDA，未安装 GPU 版时使用 CPU')
+    parser.add_argument('--screen-margin', type=float, default=.05, help='屏幕设备检测框每侧外扩比例')
+    parser.add_argument('--margin', type=float, default=.2, help='人脸检测框每侧外扩比例')
     parser.add_argument('--hold', type=float, default=.3, help='检测前后延长遮罩秒数，缓解漏检和闪烁')
     parser.add_argument('--block-size', type=int, default=32, help='原图马赛克块尺寸（像素）')
     parser.add_argument('--encoder', choices=['auto', 'cpu', 'nvenc'], default='auto',
                         help='auto 实测 NVENC，不可用时回退 CPU')
     parser.add_argument('--render-mode', choices=['auto', 'full', 'sparse'], default='auto',
-                        help='auto=兼容时仅重编码含人脸的关键帧组；full=完整编码；sparse=强制分段编码')
+                        help='auto=兼容时仅重编码需打码的关键帧组；full=完整编码；sparse=强制分段编码')
     parser.add_argument('--preset', default='superfast',
                         choices=['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'],
                         help='CPU 编码预设')
@@ -537,19 +593,22 @@ def parse_args(argv=None):
     parser.add_argument('--start', type=float, default=0, help='从指定秒数开始（预览）')
     parser.add_argument('--duration', type=float, help='只处理指定秒数（预览）')
     parser.add_argument('--scan-only', action='store_true', help='只检测并缓存，不输出视频')
-    parser.add_argument('--rescan', action='store_true', help='忽略人脸检测缓存')
+    parser.add_argument('--rescan', action='store_true', help='忽略检测缓存')
     parser.add_argument('--overwrite', action='store_true', help='覆盖已有输出，仍可复用检测缓存')
     parser.add_argument('--model', type=Path, default=MODEL, help='YuNet 2023mar ONNX 模型路径')
     args = parser.parse_args(argv)
     if args.detect_fps < 0 or args.detect_size < 64 or not 0 < args.threshold < 1:
         parser.error('detect-fps 必须 >=0，detect-size 必须 >=64，threshold 必须在 (0,1)')
+    if not 0 < args.screen_threshold < 1 or args.screen_margin < 0:
+        parser.error('screen-threshold 必须在 (0,1)，screen-margin 必须非负')
     if min(args.jobs, args.threads, args.block_size) < 1 or args.margin < 0 or args.hold < 0:
         parser.error('jobs/threads/block-size 必须为正，margin/hold 必须非负')
     if args.start < 0 or (args.duration is not None and args.duration <= 0) or not 0 <= args.quality <= 51:
         parser.error('start 必须非负，duration 必须为正，quality 必须在 0–51')
     if args.scan_only and args.mode == 'mute':
         parser.error('--scan-only 不适用于 --mode mute')
-    for key in ('input', 'output', 'model'):
+    args.targets = sorted(set(args.targets))
+    for key in ('input', 'output', 'model', 'screen_model'):
         setattr(args, key, getattr(args, key).expanduser().resolve())
     return args
 
@@ -580,7 +639,10 @@ def main(argv=None):
         import cv2
         # OpenCV's global pool is shared by batch workers; avoid CPU oversubscription.
         cv2.setNumThreads(args.threads)
-        ensure_model(args.model)
+        if 'face' in args.targets:
+            ensure_model(args.model)
+        if 'screen' in args.targets:
+            screen_detector.ensure_model(args.screen_model)
     encoder = choose_encoder(args.encoder) if args.mode != 'mute' and not args.scan_only else 'libx264'
     log(f'共 {len(tasks)} 个视频，并发 {args.jobs}，输出：{args.output}')
     failures = []
