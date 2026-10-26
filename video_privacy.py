@@ -521,7 +521,7 @@ def parse_args(argv=None):
                         help='每秒检测帧数；0=按原始时间戳逐帧检测，抽帧可能漏掉短暂人脸')
     parser.add_argument('--detect-size', type=int, default=640, help='检测图最长边；小脸多时可设 960/1280')
     parser.add_argument('--threshold', type=float, default=.65, help='人脸置信度阈值')
-    parser.add_argument('--margin', type=float, default=.4, help='检测框每侧外扩比例')
+    parser.add_argument('--margin', type=float, default=.2, help='检测框每侧外扩比例')
     parser.add_argument('--hold', type=float, default=.3, help='检测前后延长遮罩秒数，缓解漏检和闪烁')
     parser.add_argument('--block-size', type=int, default=32, help='原图马赛克块尺寸（像素）')
     parser.add_argument('--encoder', choices=['auto', 'cpu', 'nvenc'], default='auto',
