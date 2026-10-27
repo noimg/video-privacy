@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing, nullcontext
 from fractions import Fraction
 
 import screen_detector
@@ -107,16 +108,104 @@ def ensure_model(path):
     return sha
 
 
-def scan(path, info, args, cache_path):
+def refinement_intervals(detections, duration, padding):
+    """Merge the neighborhoods of coarse hits before seeking for a dense pass."""
+    result = []
+    for entry in sorted(detections, key=lambda e: e['time']):
+        if not entry['boxes']:
+            continue
+        start, end = max(0, entry['time'] - padding), min(duration, entry['time'] + padding)
+        if start >= end:
+            continue
+        if result and start <= result[-1][1]:
+            result[-1][1] = max(result[-1][1], end)
+        else:
+            result.append([start, end])
+    return result
+
+
+def decoded_samples(path, info, args, size, windows, fps, resume, next_sample, reused):
+    """Decode on one worker; only publish progress when the consumer receives it.
+
+    The final (timestamp, None) of each window accounts for its unsampled tail.
+    Seeking skips gaps between refinement windows without decoding them again.
+    """
     import av
-    import cv2
     import numpy as np
 
-    # Reuse libswscale's context and bound its pool. Frame.reformat() creates a
-    # fresh context for each sampled frame and otherwise defaults to all CPUs.
     reformatter = av.video.reformatter.VideoReformatter()
+    w, h = size
+    rw, rh = (h, w) if info['rotation'] in (90, 270) else (w, h)
+    interval = 1 / fps if fps else 0
+    tolerance = max(1.0, 3 / max(info['fps'], 1))
+    if not windows:
+        return
+    with av.open(str(path)) as container:
+        stream = next(s for s in container.streams.video if s.index == info['video_index'])
+        stream.thread_type = 'AUTO'
+        stream.codec_context.thread_count = args.threads
+        origin = float((stream.start_time or 0) * stream.time_base)
+        for begin, end in windows:
+            if end <= resume:
+                continue
+            begin = max(begin, resume)
+            seek_to = args.start + max(0, begin)
+            if seek_to > 0:
+                container.seek(int((seek_to + origin) / stream.time_base), stream=stream,
+                               backward=True, any_frame=False)
+            if interval:
+                next_sample = max(next_sample, math.ceil((begin - 1e-6) / interval) * interval)
+            last_t = resume
+            for frame in container.decode(stream):
+                if STOP.is_set():
+                    raise InterruptedError('已停止，检测进度已保存')
+                if frame.pts is None:
+                    raise ValueError('视频帧缺少时间戳，无法准确定位打码位置')
+                t = float(frame.pts * frame.time_base) - origin - args.start
+                if t < begin or t <= resume:
+                    continue
+                if t >= end:
+                    break
+                last_t = t
+                if interval and t + 1e-6 < next_sample:
+                    continue
+                if interval:
+                    next_sample = (math.floor((t + 1e-6) / interval) + 1) * interval
+                if round(t, 6) in reused:
+                    yield t, None
+                    continue
+                image = reformatter.reformat(frame, width=rw, height=rh, format='bgr24',
+                                             threads=args.threads).to_ndarray()
+                if info['rotation']:
+                    image = np.ascontiguousarray(np.rot90(image, info['rotation'] // 90))
+                yield t, image
+            # A truncated decoder must never turn an unscanned tail into "no targets".
+            if last_t < end - tolerance:
+                raise RuntimeError(f'视频提前结束：仅扫描到 {last_t:.2f}/{end:.2f}s')
+            yield last_t, None
+
+
+def prefetched_samples(iterator):
+    """Overlap decode/resize with inference, with at most one image waiting ahead."""
+    try:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='privacy-decode') as pool:
+            pending = pool.submit(next, iterator, None)
+            try:
+                while (item := pending.result()) is not None:
+                    pending = pool.submit(next, iterator, None)
+                    yield item
+            finally:
+                pending.cancel()
+    finally:
+        iterator.close()
+
+
+def scan(path, info, args, cache_path):
+    import cv2
+
     faces_enabled = 'face' in args.targets
     screens_enabled = 'screen' in args.targets
+    adaptive = args.scan_mode == 'adaptive'
     model_sha = ensure_model(args.model) if faces_enabled else None
     settings = {'version': VERSION, 'source': source_id(path), 'model': model_sha,
                 'fps': args.detect_fps, 'size': args.detect_size, 'threshold': args.threshold,
@@ -126,6 +215,9 @@ def scan(path, info, args, cache_path):
         settings['screens'] = {'version': screen_detector.VERSION, 'targets': args.targets,
                                'model': screen_detector.ensure_model(args.screen_model),
                                'threshold': args.screen_threshold, 'device': args.screen_device}
+    if adaptive:
+        settings['adaptive'] = {'version': 1, 'coarse_fps': args.coarse_fps,
+                                'refine_window': args.refine_window}
     signature = digest(settings)
     cached = {}
     if cache_path.exists() and not args.rescan:
@@ -152,80 +244,94 @@ def scan(path, info, args, cache_path):
     data = cached or {'signature': signature, 'settings': settings, 'detections': [],
                       'scanned_until': -1.0, 'next_sample': 0.0, 'samples': 0,
                       'complete': False, 'scan_seconds': 0.0}
+    if adaptive and not cached:
+        data.update(phase='coarse', coarse_times=[], coarse_samples=0, refine_samples=0)
     if screens:
         data['screen_backend'] = screens.backend
         log(f'[{path.name}] 屏幕检测：YOLOX-S / {screens.backend.upper()}，手机、笔记本、显示器')
-    interval = 1 / args.detect_fps if args.detect_fps else 0
     began = time.monotonic()
     last_save = last_log = began
     elapsed_before = data['scan_seconds']
-    resume = data['scanned_until']
-    log(f'[{path.name}] 扫描 {total:.1f}s，检测尺寸 {w}×{h}，'
-        f'{str(args.detect_fps) + " fps" if args.detect_fps else "逐帧"}'
-        + (f'，从 {resume:.1f}s 继续' if resume > 0 else ''))
 
     def save():
         data['scan_seconds'] = elapsed_before + time.monotonic() - began
         atomic_json(cache_path, data)
 
     try:
-        with av.open(str(path)) as container:
-            stream = next(s for s in container.streams.video if s.index == info['video_index'])
-            stream.thread_type = 'AUTO'
-            stream.codec_context.thread_count = args.threads
-            origin = float((stream.start_time or 0) * stream.time_base)
-            seek_to = args.start + max(0, resume)
-            if seek_to > 0:
-                container.seek(int((seek_to + origin) / stream.time_base), stream=stream,
-                               backward=True, any_frame=False)
-            for frame in container.decode(stream):
-                if STOP.is_set():
-                    raise InterruptedError('已停止，检测进度已保存')
-                if frame.pts is None:
-                    raise ValueError('视频帧缺少时间戳，无法准确定位打码位置')
-                t = float(frame.pts * frame.time_base) - origin - args.start
-                if t < 0 or t <= resume:
-                    continue
-                if t >= total:
+        # The CPU face model and CUDA screen model can infer on the same frame
+        # concurrently. CPU-only screen inference shares the main worker instead.
+        concurrent_screens = detector is not None and screens is not None and screens.backend == 'cuda'
+        screen_pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix='privacy-screen')
+                       if concurrent_screens else nullcontext())
+        with screen_pool as inference:
+            while True:
+                phase = data.get('phase', 'uniform')
+                coarse = phase == 'coarse'
+                fps = args.coarse_fps if coarse else args.detect_fps
+                interval = 1 / fps if fps else 0
+                windows = data['refine_intervals'] if phase == 'refine' else [[0, total]]
+                reused = set(data['coarse_times']) if phase == 'refine' else set()
+                resume = data['scanned_until']
+                phase_began = time.monotonic()
+                label = {'coarse': '低频初筛', 'refine': '目标附近补扫', 'uniform': '扫描'}[phase]
+                log(f'[{path.name}] {label} {sum(b - a for a, b in windows):.1f}s，'
+                    f'检测尺寸 {w}×{h}，{str(fps) + " fps" if fps else "逐帧"}'
+                    + (f'，从 {resume:.1f}s 继续' if resume > 0 else ''))
+                iterator = decoded_samples(path, info, args, (w, h), windows, fps, resume,
+                                           data['next_sample'], reused)
+                with closing(prefetched_samples(iterator)) as samples:
+                    for t, image in samples:
+                        if STOP.is_set():
+                            raise InterruptedError('已停止，检测进度已保存')
+                        if image is not None:
+                            screen_future = inference.submit(screens.detect, image) if inference else None
+                            faces = None
+                            if detector:
+                                face_image = cv2.resize(image, (fw, fh)) if (fw, fh) != (w, h) else image
+                                _, faces = detector.detect(face_image)
+                            screen_boxes = (screen_future.result() if screen_future else
+                                            screens.detect(image) if screens else [])
+                            data['samples'] += 1
+                            if coarse:
+                                data['coarse_times'].append(round(t, 6))
+                                data['coarse_samples'] += 1
+                            elif phase == 'refine':
+                                data['refine_samples'] += 1
+                            if faces is not None:
+                                boxes = []
+                                for f in faces:
+                                    x, y, bw, bh = map(float, f[:4])
+                                    boxes.append([x / fw, y / fh, bw / fw, bh / fh, float(f[14])])
+                                data['detections'].append({'time': round(t, 6), 'boxes': boxes})
+                            if screen_boxes:
+                                data['detections'].append({'time': round(t, 6), 'boxes': screen_boxes,
+                                                           'target': 'screen'})
+                        if interval:
+                            data['next_sample'] = (math.floor((t + 1e-6) / interval) + 1) * interval
+                        data['scanned_until'] = t
+                        now = time.monotonic()
+                        if now - last_save >= 30:
+                            save()
+                            last_save = now
+                        if now - last_log >= 15:
+                            covered = sum(max(0, min(t, b) - max(a, resume)) for a, b in windows)
+                            speed = covered / max(.001, now - phase_began)
+                            log(f'[{path.name}] {label}到 {t:.0f}/{total:.0f}s，{speed:.1f} 倍速，'
+                                f'检测结果 {len(data["detections"])} 组')
+                            last_log = now
+                if not coarse:
                     break
-                if interval and t + 1e-6 < data['next_sample']:
-                    data['scanned_until'] = t
-                    continue
-                rw, rh = (h, w) if info['rotation'] in (90, 270) else (w, h)
-                image = reformatter.reformat(frame, width=rw, height=rh, format='bgr24',
-                                             threads=args.threads).to_ndarray()
-                if info['rotation']:
-                    image = np.ascontiguousarray(np.rot90(image, info['rotation'] // 90))
-                faces = None
-                if detector:
-                    face_image = cv2.resize(image, (fw, fh)) if (fw, fh) != (w, h) else image
-                    _, faces = detector.detect(face_image)
-                screen_boxes = screens.detect(image) if screens else []
-                data['samples'] += 1
-                if faces is not None:
-                    boxes = []
-                    for f in faces:
-                        x, y, bw, bh = map(float, f[:4])
-                        boxes.append([x / fw, y / fh, bw / fw, bh / fh, float(f[14])])
-                    data['detections'].append({'time': round(t, 6), 'boxes': boxes})
-                if screen_boxes:
-                    data['detections'].append({'time': round(t, 6), 'boxes': screen_boxes,
-                                               'target': 'screen'})
-                if interval:
-                    data['next_sample'] = (math.floor((t + 1e-6) / interval) + 1) * interval
-                data['scanned_until'] = t
-                now = time.monotonic()
-                if now - last_save >= 30:
-                    save()
-                    last_save = now
-                if now - last_log >= 15:
-                    speed = (t - max(0, resume)) / max(.001, now - began)
-                    log(f'[{path.name}] 扫描 {t:.0f}/{total:.0f}s，{speed:.1f} 倍速，'
-                        f'检测结果 {len(data["detections"])} 组')
-                    last_log = now
-        # A truncated decoder must never turn an unscanned tail into "no targets".
-        if data['scanned_until'] < total - max(1.0, 3 / max(info['fps'], 1)):
-            raise RuntimeError(f'视频提前结束：仅扫描到 {data["scanned_until"]:.2f}/{total:.2f}s')
+                data['coarse_scanned_until'] = data['scanned_until']
+                data['refine_intervals'] = refinement_intervals(
+                    data['detections'], total, max(args.refine_window, 1 / args.coarse_fps))
+                data.update(phase='refine', scanned_until=-1.0, next_sample=0.0)
+                log(f'[{path.name}] 初筛完成，需补扫 {len(data["refine_intervals"])} 个片段，'
+                    f'共 {sum(b - a for a, b in data["refine_intervals"]):.1f}/{total:.1f}s')
+                save()
+        if adaptive:
+            data['detections'].sort(key=lambda e: (e['time'], e.get('target', 'face')))
+            data['scanned_until'] = data['coarse_scanned_until']
+            data['phase'] = 'complete'
         data['complete'] = True
         data['scan_size'] = [w, h]
         save()
@@ -505,6 +611,9 @@ def process_video(path, output, args, encoder):
     if args.start >= info['duration']:
         raise ValueError('起始时间超出视频长度')
     ignored = {'input', 'output', 'jobs', 'overwrite', 'rescan', 'scan_only'}
+    # Preserve completed-output signatures for the unchanged uniform sampling.
+    if args.scan_mode == 'uniform' or args.mode == 'mute':
+        ignored.update({'scan_mode', 'coarse_fps', 'refine_window'})
     if args.mode == 'mute' or args.targets == ['face']:
         ignored.update({'targets', 'screen_model', 'screen_threshold', 'screen_device', 'screen_margin'})
     identity = {'version': RENDER_VERSION, 'source': source_id(path),
@@ -527,6 +636,8 @@ def process_video(path, output, args, encoder):
     cache_name = digest(str(path))[:20]
     if 'screen' in args.targets:
         cache_name += '-' + '-'.join(args.targets)
+    if args.scan_mode == 'adaptive':
+        cache_name += '-adaptive'
     cache_path = args.output / '.cache' / (cache_name + '.json')
     data = None if args.mode == 'mute' else scan(path, info, args, cache_path)
     if args.scan_only:
@@ -537,6 +648,10 @@ def process_video(path, output, args, encoder):
     report = {'signature': signature, 'input': str(path), 'output': str(output),
               'source': info, 'mode': args.mode, 'style': args.style,
               'targets': args.targets, 'detect_fps': args.detect_fps,
+              'scan_mode': args.scan_mode,
+              'coarse_samples': data.get('coarse_samples', 0) if data else 0,
+              'refine_samples': data.get('refine_samples', 0) if data else 0,
+              'refine_seconds': sum(b - a for a, b in data.get('refine_intervals', [])) if data else 0,
               'face_samples': sum(e.get('target', 'face') == 'face'
                                   for e in data['detections']) if data else 0,
               'screen_samples': sum(e.get('target') == 'screen'
@@ -568,6 +683,12 @@ def parse_args(argv=None):
                         help='打码对象：face=人脸，screen=手机/笔记本/显示器；可同时指定')
     parser.add_argument('--detect-fps', type=float, default=5,
                         help='人脸和屏幕每秒检测帧数；0=逐帧检测，抽帧可能漏掉短暂目标')
+    parser.add_argument('--scan-mode', choices=['uniform', 'adaptive'], default='uniform',
+                        help='uniform=固定频率；adaptive=低频初筛后补扫目标附近，可能漏掉初筛间隔内的短暂目标')
+    parser.add_argument('--coarse-fps', type=float, default=1,
+                        help='adaptive 模式初筛帧率；发现目标的前后片段按 detect-fps 补扫')
+    parser.add_argument('--refine-window', type=float, default=2,
+                        help='adaptive 模式在初筛目标前后补扫的秒数，至少覆盖一个初筛间隔')
     parser.add_argument('--detect-size', type=int, default=640,
                         help='人脸检测图最长边；小脸多时可设 960/1280；屏幕模型固定输入 640×640')
     parser.add_argument('--threshold', type=float, default=.65, help='人脸置信度阈值')
@@ -599,6 +720,11 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.detect_fps < 0 or args.detect_size < 64 or not 0 < args.threshold < 1:
         parser.error('detect-fps 必须 >=0，detect-size 必须 >=64，threshold 必须在 (0,1)')
+    if (not all(math.isfinite(v) for v in (args.detect_fps, args.coarse_fps, args.refine_window))
+            or args.coarse_fps <= 0 or args.refine_window < 0):
+        parser.error('检测频率和补扫窗口必须为有限数值，coarse-fps 必须为正，refine-window 必须非负')
+    if args.scan_mode == 'adaptive' and (args.detect_fps == 0 or args.coarse_fps > args.detect_fps):
+        parser.error('adaptive 模式需要 0 < coarse-fps <= detect-fps；逐帧检测请使用 uniform')
     if not 0 < args.screen_threshold < 1 or args.screen_margin < 0:
         parser.error('screen-threshold 必须在 (0,1)，screen-margin 必须非负')
     if min(args.jobs, args.threads, args.block_size) < 1 or args.margin < 0 or args.hold < 0:
