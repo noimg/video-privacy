@@ -29,36 +29,36 @@ CPU 版和 GPU 版选择一种安装。`--screen-device auto` 优先使用可用
 python video_privacy.py ../Videos-origin -o ../Videos-processed --targets face screen
 
 # 仅给手机和电脑屏幕打码，保留音频
-python video_privacy.py ../Videos-origin -o ../Videos-screens --targets screen --mode blur
+python video_privacy.py ../Videos-origin -o ../Videos-processed --targets screen --mode blur
 
 # 静音 + 人脸马赛克；输入可以是文件或目录
-python video_privacy.py ../Videos-origin -o ./Videos-processed --jobs 2
+python video_privacy.py ../Videos-origin -o ../Videos-processed --jobs 2
 
 # 仅去音频，直接复制视频流，不损失视频画质
-python video_privacy.py ../Videos-origin -o ./Videos-muted --mode mute
+python video_privacy.py ../Videos-origin -o ../Videos-processed --mode mute
 
 # 仅人脸打码，保留音频
-python video_privacy.py ../Videos-origin -o ./Videos-blurred --mode blur
+python video_privacy.py ../Videos-origin -o ../Videos-processed --mode blur
 
 # 使用黑块遮挡
-python video_privacy.py ../Videos-origin -o ./Videos-black --style black
+python video_privacy.py ../Videos-origin -o ../Videos-processed --style black
 
 # 先处理前两分钟，检查效果
-python video_privacy.py ../Videos-origin -o ./Videos-preview --duration 120
+python video_privacy.py ../Videos-origin -o ../Videos-processed --duration 120
 ```
 
 `--targets` 默认仍为 `face`；启用新功能时指定 `screen`，或指定 `face screen` 同时处理。屏幕检测识别手机、笔记本和显示器/电视，**遮罩覆盖整台设备的矩形框**，包括笔记本键盘、设备边框以及框内背景；不按固定比例裁切屏幕，以覆盖倾斜、竖屏和部分遮挡的设备。默认每侧外扩 5%，用 `--screen-margin` 调整；人脸继续使用 `--margin`（默认 20%）。
 
 细小、模糊、被遮挡或占满画面而缺少设备外观的屏幕可能漏检。屏幕检测置信度默认为 `0.3`，可用 `--screen-threshold 0.2` 增加召回率，同时也会增加误检。需要遮住细小文字时，建议 `--style black`，或增大 `--block-size` 后检查马赛克效果。
 
-目录会递归处理，输出统一为 MP4，并保留子目录结构。不指定路径时，默认读取项目同级的 `Videos-origin`，输出到同级的 `Videos-processed`。
+目录会递归处理，输出统一为 MP4，并保留子目录结构。不指定路径时，默认输入目录为 `../Videos-origin`，默认输出目录为 `../Videos-processed`（均位于项目同级）。
 
 ## 检测与速度
 
 默认每秒检测 5 帧，人脸检测图最长边为 640 像素，屏幕模型固定使用 640×640 输入并等比补边；两类检测共用一次解码和取样。解码/缩放与检测流水执行；同时启用人脸和 CUDA 屏幕检测时，两种模型并行推理。预取最多一张待检测图，避免长视频占用不断增长的内存；原有固定频率采样和检测缓存保持兼容。遮罩扩大并前后延长，减少运动造成的漏遮。抽帧可能漏掉短暂出现的目标，小脸、侧脸和遮挡也可能漏检。需要更高覆盖率时，可逐帧检测并提高人脸检测分辨率：
 
 ```bash
-python video_privacy.py ./Videos-origin -o ./Videos-careful --detect-fps 0 --detect-size 1280 --threshold 0.5
+python video_privacy.py ../Videos-origin -o ../Videos-processed --detect-fps 0 --detect-size 1280 --threshold 0.5
 ```
 
 后续视频中人脸和屏幕较少时，可选择自适应扫描：
@@ -75,19 +75,19 @@ CPU 编码默认采用分段编码：**只重编码需要打码的关键帧组�
 
 ```bash
 # 长视频：GPU 检测 + 仅重编码需打码片段
-python video_privacy.py ../videos -o ../Videos-processed --targets face screen --screen-device cuda --encoder cpu
+python video_privacy.py ../Videos-origin -o ../Videos-processed --targets face screen --screen-device cuda --encoder cpu
 
 # 先检查含电脑的片段（该预览从第 2690 秒开始）
-python video_privacy.py ../videos -o ../Videos-screen-preview --targets face screen --start 2690 --duration 60 --style black
+python video_privacy.py ../Videos-origin -o ../Videos-processed --targets face screen --start 2690 --duration 60 --style black
 
 # 优先处理速度：每秒检测 2 帧；会增加短暂目标漏检风险
-python video_privacy.py ../videos -o ../Videos-fast --targets face screen --detect-fps 2 --encoder cpu
+python video_privacy.py ../Videos-origin -o ../Videos-processed --targets face screen --detect-fps 2 --encoder cpu
 
 # 复用已有检测缓存，重新生成输出（例如调整遮盖范围后）
-python video_privacy.py ./Videos-origin -o ./Videos-processed --encoder cpu --overwrite
+python video_privacy.py ../Videos-origin -o ../Videos-processed --encoder cpu --overwrite
 
 # 使用完整编码，提高播放器兼容性
-python video_privacy.py ./Videos-origin -o ./Videos-full --render-mode full
+python video_privacy.py ../Videos-origin -o ../Videos-processed --render-mode full
 ```
 
 分段编码支持无 B 帧、无旋转的偶数尺寸 H.264 / YUV420P 视频。其他格式、非零 `--start`、无损编码（`--quality 0`）会自动回退完整编码；`--render-mode sparse` 可强制分段处理并在不兼容时报告错误。输出使用 MP4 / avc3 封装，若播放器兼容性有问题可改用 `--render-mode full`。
@@ -103,7 +103,7 @@ python video_privacy.py ./Videos-origin -o ./Videos-full --render-mode full
 例如，将每侧外扩比例缩小到 10%，并重新生成已有输出：
 
 ```bash
-python video_privacy.py ./Videos-origin -o ./Videos-processed --margin 0.1 --overwrite
+python video_privacy.py ../Videos-origin -o ../Videos-processed --margin 0.1 --overwrite
 ```
 
 建议先用 `--duration 120` 预览效果，确认遮盖范围后再处理全片。查看全部参数：
